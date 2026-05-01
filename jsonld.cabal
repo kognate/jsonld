@@ -53,6 +53,7 @@ library
     hs-source-dirs:     src
     exposed-modules:
         Data.JsonLd
+        Data.JsonLd.Bridge
         Data.JsonLd.Error
         Data.JsonLd.Iri
         Data.JsonLd.Keyword
@@ -66,6 +67,9 @@ test-suite jsonld-w3c
     hs-source-dirs:     test
     main-is:            Main.hs
     other-modules:
+        Test.JsonLd.BridgeSpec
+        Test.JsonLd.IriSpec
+        Test.JsonLd.KeywordSpec
         Test.JsonLd.W3C
     build-depends:
           jsonld
