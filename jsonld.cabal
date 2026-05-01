@@ -54,6 +54,7 @@ library
     exposed-modules:
         Data.JsonLd
         Data.JsonLd.Bridge
+        Data.JsonLd.Context
         Data.JsonLd.Error
         Data.JsonLd.Iri
         Data.JsonLd.Keyword
@@ -68,6 +69,7 @@ test-suite jsonld-w3c
     main-is:            Main.hs
     other-modules:
         Test.JsonLd.BridgeSpec
+        Test.JsonLd.ContextSpec
         Test.JsonLd.IriSpec
         Test.JsonLd.KeywordSpec
         Test.JsonLd.W3C
