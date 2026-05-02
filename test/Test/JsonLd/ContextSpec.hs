@@ -220,6 +220,111 @@ tests = testGroup "Data.JsonLd.Context"
         , testCase "keyword passes through" $
             expandIriCtx startCtx True False "@id" @?= Right "@id"
         ]
+
+    , testGroup "forward references"
+        [ testCase "compact IRI uses prefix defined later in same context" $ do
+            -- "name" appears before "ex" so processing it must trigger
+            -- the recursive Create Term Definition for "ex".
+            ac <- expectOk (object
+                [ "name" .= ("ex:name" :: String)
+                , "ex"   .= ("http://example/" :: String)
+                ])
+            tdIri <$> Map.lookup "name" (acTerms ac)
+                @?= Just (Just "http://example/name")
+
+        , testCase "object @id uses forward-referenced prefix" $ do
+            ac <- expectOk (object
+                [ "p"  .= object ["@id" .= ("ex:p" :: String)]
+                , "ex" .= ("http://example/" :: String)
+                ])
+            tdIri <$> Map.lookup "p" (acTerms ac)
+                @?= Just (Just "http://example/p")
+
+        , testCase "@type uses forward-referenced prefix" $ do
+            ac <- expectOk (object
+                [ "age" .= object
+                    [ "@id"   .= ("http://example/age" :: String)
+                    , "@type" .= ("xsd:integer" :: String)
+                    ]
+                , "xsd" .= ("http://www.w3.org/2001/XMLSchema#" :: String)
+                ])
+            (tdType =<< Map.lookup "age" (acTerms ac))
+                @?= Just "http://www.w3.org/2001/XMLSchema#integer"
+
+        , testCase "circular term mappings detected" $
+            expectErr CyclicIriMapping
+                (object
+                    [ "a" .= ("b:foo" :: String)
+                    , "b" .= ("a:bar" :: String)
+                    ])
+        ]
+
+    , testGroup "@container combination validation"
+        [ testCase "@list + @set rejected" $
+            expectErr InvalidContainerMapping
+                (object
+                    [ "x" .= object
+                        [ "@id"        .= ("http://x/" :: String)
+                        , "@container" .= (["@list", "@set"] :: [String])
+                        ]
+                    ])
+
+        , testCase "@graph + @id is valid" $ do
+            ac <- expectOk (object
+                [ "g" .= object
+                    [ "@id"        .= ("http://example/g" :: String)
+                    , "@container" .= (["@graph", "@id"] :: [String])
+                    ]
+                ])
+            (tdContainers <$> Map.lookup "g" (acTerms ac))
+                @?= Just [CGraph, CId]
+
+        , testCase "@graph + @id + @set is valid" $ do
+            ac <- expectOk (object
+                [ "g" .= object
+                    [ "@id"        .= ("http://example/g" :: String)
+                    , "@container" .= (["@graph", "@id", "@set"] :: [String])
+                    ]
+                ])
+            -- Stored in source order; validation accepts the combo.
+            (tdContainers <$> Map.lookup "g" (acTerms ac))
+                @?= Just [CGraph, CId, CSet]
+
+        , testCase "validContainerCombination matrix" $ do
+            validContainerCombination [CList]               @?= True
+            validContainerCombination [CSet, CIndex]        @?= True
+            validContainerCombination [CGraph, CId]         @?= True
+            validContainerCombination [CSet, CGraph, CId]   @?= True
+            validContainerCombination [CList, CSet]         @?= False
+            validContainerCombination [CType, CLanguage]    @?= False
+            validContainerCombination []                    @?= False
+        ]
+
+    , testGroup "scoped @context"
+        [ testCase "valid scoped context is stored verbatim" $ do
+            let ctx = object
+                    [ "p" .= object
+                        [ "@id" .= ("http://example/p" :: String)
+                        , "@context" .= object
+                            [ "inner" .= ("http://example/inner" :: String) ]
+                        ]
+                    ]
+            ac <- expectOk ctx
+            -- @context is stored on the term as a verbatim Value.
+            case Map.lookup "p" (acTerms ac) >>= tdContext of
+                Just _  -> pure ()
+                Nothing -> assertFailure "expected scoped @context to be stored"
+
+        , testCase "scoped context with invalid local context propagates error" $
+            -- Inner @context is a number (not a valid local context).
+            expectErr InvalidLocalContext
+                (object
+                    [ "p" .= object
+                        [ "@id" .= ("http://example/p" :: String)
+                        , "@context" .= (42 :: Int)
+                        ]
+                    ])
+        ]
     ]
 
 ------------------------------------------------------------------------

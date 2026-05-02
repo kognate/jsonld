@@ -26,6 +26,7 @@ module Data.JsonLd.Context
     , Container (..)
     , containerText
     , parseContainer
+    , validContainerCombination
     , TermSlot (..)
       -- * Configuration
     , CtxConfig (..)
@@ -40,6 +41,7 @@ import           Control.Monad       (foldM, when)
 import           Data.Aeson          (Value (..))
 import qualified Data.Aeson.Key      as Key
 import qualified Data.Aeson.KeyMap   as KM
+import qualified Data.List           as List
 import           Data.Map.Strict     (Map)
 import qualified Data.Map.Strict     as Map
 import           Data.Maybe          (isJust)
@@ -500,12 +502,42 @@ createTermDefinition cfg ctxMap active term defined protectedDefault = do
                     _ -> Right newTd
         finalise (ac { acTerms = Map.insert term resolved (acTerms ac) }) defined1
 
+    -- IRI expansion that first ensures any prefix dependency in the
+    -- value is defined. Threads the active context and defined map.
+    expandResolving :: Bool -> Bool -> Text -> ActiveContext -> Map Text Bool
+                    -> Either JsonLdError (Text, ActiveContext, Map Text Bool)
+    expandResolving vocab docRel value ac0 d0 = do
+        (ac1, d1) <- ensureRefs value ac0 d0
+        iri       <- expandIriCtx ac1 vocab docRel value
+        Right (iri, ac1, d1)
+
+    -- For a value that may be a term or a compact IRI, recursively
+    -- define the (possibly forward-referenced) term it depends on.
+    ensureRefs v ac0 d0
+        | T.null v || isKeyword v || isKeywordLike v = Right (ac0, d0)
+        | otherwise =
+            let (before, after) = T.break (== ':') v
+            in if T.null after
+                -- No colon: the value might be a bare term.
+                then ensureDef v ac0 d0
+                else if T.null before
+                          || before == "_"
+                          || "//" `T.isPrefixOf` T.drop 1 after
+                    -- Starts-with-colon, blank node, or absolute IRI.
+                    then Right (ac0, d0)
+                    else ensureDef before ac0 d0
+
+    ensureDef t ac0 d0
+        | KM.member (Key.fromText t) ctxMap
+            = createTermDefinition cfg ctxMap ac0 t d0 protectedDefault
+        | otherwise = Right (ac0, d0)
+
     -- A term whose value is just a string is shorthand for {"@id": s}.
     defineWithIri :: ActiveContext -> Map Text Bool -> Text
                   -> Either JsonLdError (ActiveContext, Map Text Bool)
     defineWithIri ac defined1 s = do
-        iri <- expandIriCtx ac True False s
-        commit ac defined1 defaultTermDefinition
+        (iri, ac1, defined2) <- expandResolving True False s ac defined1
+        commit ac1 defined2 defaultTermDefinition
             { tdIri       = Just iri
             , tdProtected = protectedDefault
             , tdBaseUrl   = ccBaseUrl cfg
@@ -536,53 +568,59 @@ createTermDefinition cfg ctxMap active term defined protectedDefault = do
             Just _              -> Left $ JsonLdError InvalidProtectedValue
                 ("@protected on " <> term <> " must be a boolean")
 
-        -- @reverse vs @id mutually-exclusive setup.
+        -- @reverse vs @id mutually-exclusive.
         let reverseEntry = getKey "@reverse"
             idEntry      = getKey "@id"
-
         when (isJust reverseEntry && isJust idEntry) $
             Left $ JsonLdError InvalidReverseProperty
                 ("term " <> term <> " has both @id and @reverse")
 
-        -- Resolve IRI mapping.
-        (iri, isReverse) <- case (reverseEntry, idEntry) of
+        -- IRI mapping (state pass 1).
+        (iri, isReverse, ac1, defined2) <- case (reverseEntry, idEntry) of
             (Just (String r), _) -> do
-                expanded <- expandIriCtx ac True False r
-                pure (Just expanded, True)
+                (e, a, d) <- expandResolving True False r ac defined1
+                pure (Just e, True, a, d)
             (Just _, _) -> Left $ JsonLdError InvalidIriMapping
                 ("@reverse on " <> term <> " must be a string")
-            (Nothing, Just Null) -> pure (Nothing, False)
+            (Nothing, Just Null) -> pure (Nothing, False, ac, defined1)
             (Nothing, Just (String i)) -> do
-                expanded <- expandIriCtx ac True False i
-                pure (Just expanded, False)
+                (e, a, d) <- expandResolving True False i ac defined1
+                pure (Just e, False, a, d)
             (Nothing, Just _) -> Left $ JsonLdError InvalidIriMapping
                 ("@id on " <> term <> " must be a string or null")
             (Nothing, Nothing)
                 -- No @id: term is itself a compact IRI or uses @vocab.
                 | T.elem ':' term -> do
-                    expanded <- expandIriCtx ac True False term
-                    pure (Just expanded, False)
+                    (e, a, d) <- expandResolving True False term ac defined1
+                    pure (Just e, False, a, d)
                 | Just _ <- acVocab ac -> do
-                    expanded <- expandIriCtx ac True False term
-                    pure (Just expanded, False)
+                    (e, a, d) <- expandResolving True False term ac defined1
+                    pure (Just e, False, a, d)
                 | otherwise -> Left $ JsonLdError InvalidIriMapping
                     ("term " <> term <> " has no @id and no @vocab to resolve against")
 
-        -- @type
-        typeIri <- case getKey "@type" of
-            Nothing                 -> Right Nothing
-            Just (String "@id")     -> Right (Just "@id")
-            Just (String "@vocab")  -> Right (Just "@vocab")
-            Just (String "@json")   -> Right (Just "@json")
-            Just (String "@none")   -> Right (Just "@none")
-            Just (String t)         -> Just <$> expandIriCtx ac True False t
-            Just _                  -> Left $ JsonLdError InvalidTypeMapping
+        -- @type expansion (state pass 2).
+        (typeIri, ac2, defined3) <- case getKey "@type" of
+            Nothing                -> Right (Nothing,         ac1, defined2)
+            Just (String "@id")    -> Right (Just "@id",      ac1, defined2)
+            Just (String "@vocab") -> Right (Just "@vocab",   ac1, defined2)
+            Just (String "@json")  -> Right (Just "@json",    ac1, defined2)
+            Just (String "@none")  -> Right (Just "@none",    ac1, defined2)
+            Just (String t) -> do
+                (e, a, d) <- expandResolving True False t ac1 defined2
+                pure (Just e, a, d)
+            Just _ -> Left $ JsonLdError InvalidTypeMapping
                 ("@type on " <> term <> " must be a string")
 
-        -- @container
+        -- @container with combination validation.
         containers <- case getKey "@container" of
             Nothing -> Right []
-            Just v  -> parseContainerValue term v
+            Just v  -> do
+                cs <- parseContainerValue term v
+                if validContainerCombination cs
+                    then Right cs
+                    else Left $ JsonLdError InvalidContainerMapping
+                        ("invalid @container combination on " <> term)
 
         -- @prefix
         prefixFlag <- case getKey "@prefix" of
@@ -617,17 +655,27 @@ createTermDefinition cfg ctxMap active term defined protectedDefault = do
 
         -- @direction (term-level)
         dirSlot <- case getKey "@direction" of
-            Nothing            -> Right SlotUnset
-            Just Null          -> Right SlotNull
+            Nothing             -> Right SlotUnset
+            Just Null           -> Right SlotNull
             Just (String "ltr") -> Right (SlotValue "ltr")
             Just (String "rtl") -> Right (SlotValue "rtl")
             Just _ -> Left $ JsonLdError InvalidBaseDirection
                 ("@direction on " <> term <> " must be \"ltr\", \"rtl\", or null")
 
-        -- @context (scoped) — stored verbatim; recursive validation deferred.
-        let scopedCtx = getKey "@context"
+        -- @context (scoped). Per §4.2.2 step 27: validate by
+        -- recursively running the Context Processing algorithm with
+        -- override-protected=True and validate-scoped=False, then
+        -- store the original value verbatim. The result is discarded.
+        scopedCtx <- case getKey "@context" of
+            Nothing -> Right Nothing
+            Just c ->
+                let scopedCfg = cfg
+                        { ccOverrideProtected = True
+                        , ccValidateScoped    = False
+                        }
+                in processContext scopedCfg ac2 c >> Right (Just c)
 
-        commit ac defined1 defaultTermDefinition
+        commit ac2 defined3 defaultTermDefinition
             { tdIri        = iri
             , tdReverse    = isReverse
             , tdProtected  = protectedFlag
@@ -647,6 +695,25 @@ createTermDefinition cfg ctxMap active term defined protectedDefault = do
 -- equivalent if they differ only in protection.
 unprotect :: TermDefinition -> TermDefinition
 unprotect t = t { tdProtected = False }
+
+-- | Validate that a list of containers forms a legal @\@container@
+-- value per JSON-LD 1.1 §4.4.1. The valid combinations are: any single
+-- keyword; @\@set@ paired with one of @\@index@, @\@id@, @\@type@,
+-- @\@language@, or @\@graph@; @\@graph@ paired with @\@id@ or
+-- @\@index@; or @\@graph@ + @\@set@ paired with @\@id@ or @\@index@.
+validContainerCombination :: [Container] -> Bool
+validContainerCombination cs = case List.sort (List.nub cs) of
+    [_]                    -> True
+    [CSet, CIndex]         -> True
+    [CSet, CGraph]         -> True
+    [CSet, CId]            -> True
+    [CSet, CType]          -> True
+    [CSet, CLanguage]      -> True
+    [CIndex, CGraph]       -> True
+    [CGraph, CId]          -> True
+    [CSet, CIndex, CGraph] -> True
+    [CSet, CGraph, CId]    -> True
+    _                      -> False
 
 parseContainerValue :: Text -> Value -> Either JsonLdError [Container]
 parseContainerValue term = \case
