@@ -56,6 +56,7 @@ library
         Data.JsonLd.Bridge
         Data.JsonLd.Context
         Data.JsonLd.Error
+        Data.JsonLd.Expand
         Data.JsonLd.Iri
         Data.JsonLd.Keyword
         Data.JsonLd.Types
@@ -70,6 +71,7 @@ test-suite jsonld-w3c
     other-modules:
         Test.JsonLd.BridgeSpec
         Test.JsonLd.ContextSpec
+        Test.JsonLd.ExpandSpec
         Test.JsonLd.IriSpec
         Test.JsonLd.KeywordSpec
         Test.JsonLd.W3C

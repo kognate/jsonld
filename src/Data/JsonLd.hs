@@ -20,13 +20,14 @@ module Data.JsonLd
 import           Data.Aeson           (Value)
 
 import           Data.JsonLd.Error
+import qualified Data.JsonLd.Expand   as Expand
 import           Data.JsonLd.Types
 
 notImplemented :: Either JsonLdError a
 notImplemented = Left (JsonLdError NotImplemented "algorithm not yet implemented")
 
 expand :: Options -> Document -> Either JsonLdError Value
-expand _ _ = notImplemented
+expand = Expand.expandDocument
 
 compact :: Options -> Value -> Document -> Either JsonLdError Value
 compact _ _ _ = notImplemented
