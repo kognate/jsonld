@@ -4,17 +4,26 @@
 -- | The Expansion algorithm — JSON-LD 1.1 API §5.1.
 --
 -- Spec references in comments use the section numbering from
--- <https://www.w3.org/TR/json-ld11-api/#expansion-algorithms>. As with
--- the context-processing module, several spec features are deferred:
+-- <https://www.w3.org/TR/json-ld11-api/#expansion-algorithms>.
 --
---  * Container expansion for @\@language@, @\@index@, @\@id@,
---    @\@type@, @\@graph@ maps
---  * @\@reverse@, @\@nest@, @\@included@
---  * Type-scoped and property-scoped contexts at expand time
---  * @\@direction@ on values
+-- Currently implemented:
+--
+--  * Null, scalar, array, and object expansion (§5.1.2)
+--  * Top-level @\@graph@-only unwrap and free-floating drop (§5.1.1)
+--  * Keywords: @\@id@, @\@type@, @\@value@, @\@language@, @\@index@,
+--    @\@list@, @\@set@, @\@graph@, @\@reverse@
+--  * Type-scoped (§5.1.2 step 8) and property-scoped (§5.1.2 step
+--    13.5) contexts
+--  * Type coercion: @\@id@, @\@vocab@, @\@json@, IRI-typed values
+--  * Term-level @\@language@ \/ @\@direction@ slots with
+--    explicit-null semantics, falling back to active context defaults
+--  * Container maps: @\@language@, @\@index@, @\@id@
+--
+-- Still deferred:
+--
+--  * Container maps for @\@type@ and @\@graph@
+--  * @\@nest@, @\@included@
 --  * Frame-expansion mode
---
--- These return 'NotImplemented' or simply pass values through unchanged.
 module Data.JsonLd.Expand
     ( expandDocument
     , expandElement
@@ -241,6 +250,10 @@ handleProperty cfg ctx acc expandedKey origKey value = do
     case (containers, value) of
         (cs, Object km) | CLanguage `elem` cs ->
             expandLanguageMap acc expandedKey km
+        (cs, Object km) | CIndex `elem` cs ->
+            expandIndexMap cfg ctx' acc expandedKey origKey km
+        (cs, Object km) | CId `elem` cs ->
+            expandIdMap cfg ctx' acc expandedKey origKey km
         _ -> do
             expanded <- expandElement cfg ctx' (Just origKey) value
             let arr = case expanded of
@@ -278,6 +291,84 @@ expandLanguageMap acc expandedKey langMap = do
 
     valueObj s (Just l) = object [("@value", String s), ("@language", String l)]
     valueObj s Nothing  = object [("@value", String s)]
+
+-- | Expand a value used with @\@container: @\@index@ — a map keyed by
+-- arbitrary index strings whose values are expanded as if they were
+-- the term's value, with @\@index@ added to each result. The special
+-- key @\@none@ leaves @\@index@ off.
+expandIndexMap
+    :: CtxConfig
+    -> ActiveContext
+    -> KM.KeyMap Value
+    -> Text         -- ^ expanded key (the IRI)
+    -> Text         -- ^ original term name
+    -> KM.KeyMap Value
+    -> Either JsonLdError (KM.KeyMap Value)
+expandIndexMap cfg ctx acc expandedKey origKey idxMap = do
+    pairs <- concat <$> traverse expandPair (KM.toList idxMap)
+    let arr = Array (V.fromList pairs)
+    Right (KM.insertWith mergeArrays (Key.fromText expandedKey) arr acc)
+  where
+    expandPair (idxKey, val) = do
+        let idxText = Key.toText idxKey
+            mIdx | idxText == "@none" = Nothing
+                 | otherwise          = Just idxText
+            valArr = case val of
+                Array vs -> V.toList vs
+                v        -> [v]
+        items <- traverse (expandElement cfg ctx (Just origKey)) valArr
+        let unwrapped = concatMap unwrap items
+        Right (case mIdx of
+            Just idx -> map (addIndex idx) unwrapped
+            Nothing  -> unwrapped)
+
+    unwrap (Array vs) = V.toList vs
+    unwrap Null       = []
+    unwrap v          = [v]
+
+    addIndex idx (Object km)
+        | not (KM.member "@index" km) = Object (KM.insert "@index" (String idx) km)
+        | otherwise                   = Object km
+    addIndex _ v = v
+
+-- | Expand a value used with @\@container: @\@id@ — a map keyed by IRIs
+-- (or terms) whose values are expanded as if they were the term's value.
+-- @\@id@ is added to each map-value result. The special key @\@none@
+-- omits the @\@id@.
+expandIdMap
+    :: CtxConfig
+    -> ActiveContext
+    -> KM.KeyMap Value
+    -> Text         -- ^ expanded key (the IRI)
+    -> Text         -- ^ original term name
+    -> KM.KeyMap Value
+    -> Either JsonLdError (KM.KeyMap Value)
+expandIdMap cfg ctx acc expandedKey origKey idMap = do
+    pairs <- concat <$> traverse expandPair (KM.toList idMap)
+    let arr = Array (V.fromList pairs)
+    Right (KM.insertWith mergeArrays (Key.fromText expandedKey) arr acc)
+  where
+    expandPair (idKey, val) = do
+        let keyText = Key.toText idKey
+        mIri <- if keyText == "@none"
+            then Right Nothing
+            else Just <$> expandIriCtx ctx False True keyText
+        let valArr = case val of
+                Array vs -> V.toList vs
+                v        -> [v]
+        items <- traverse (expandElement cfg ctx (Just origKey)) valArr
+        let unwrapped = concatMap unwrap items
+        Right (map (addId mIri) unwrapped)
+
+    unwrap (Array vs) = V.toList vs
+    unwrap Null       = []
+    unwrap v          = [v]
+
+    addId Nothing v             = v
+    addId (Just iri) (Object km)
+        | not (KM.member "@id" km) = Object (KM.insert "@id" (String iri) km)
+        | otherwise                = Object km
+    addId _ v                   = v
 
 -- | Keyword entry: each keyword has a specific handling rule.
 handleKeyword
@@ -332,8 +423,29 @@ handleKeyword cfg ctx mActiveProp acc kw value = case kw of
         expanded <- expandElement cfg ctx (Just "@graph") value
         Right (KM.insert "@graph" (asArrayValue expanded) acc)
 
+    "@reverse" -> case value of
+        Object km -> do
+            -- §5.1.2 step 13.4.13: expand the @reverse value as a
+            -- regular object (its entries become reverse properties),
+            -- then merge into the parent under @reverse.
+            expanded <- expandObject cfg ctx (Just "@reverse") km
+            case expanded of
+                Object expandedKm | not (KM.null expandedKm) ->
+                    Right (KM.insertWith mergeReverse "@reverse"
+                              (Object expandedKm) acc)
+                _ -> Right acc
+        _ -> Left $ JsonLdError InvalidReverseValue
+            "@reverse value must be a map"
+
     _ -> Left $ JsonLdError NotImplemented
         ("expansion of keyword " <> kw <> " is not yet implemented")
+
+-- | Merge two @\@reverse@ sub-objects by unioning their property maps,
+-- concatenating the value arrays where keys collide.
+mergeReverse :: Value -> Value -> Value
+mergeReverse (Object new) (Object old) =
+    Object (KM.unionWith mergeArrays new old)
+mergeReverse new _ = new
 
 asArrayValue :: Value -> Value
 asArrayValue = \case

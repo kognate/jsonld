@@ -256,6 +256,90 @@ tests = testGroup "Data.JsonLd.Expand"
                     [ object [ "@value" .= ("Hello" :: String) ] ]
                 ]
         run doc @?= Right expected
+
+    , testCase "@reverse keyword wraps reverse properties" $ do
+        let doc = object
+                [ "@context" .= object
+                    [ "writer" .= ("http://example/writer" :: String) ]
+                , "@reverse" .= object
+                    [ "writer" .= object
+                        [ "@id" .= ("http://author/manu" :: String) ]
+                    ]
+                ]
+            expected = Array $ V.singleton $ object
+                [ "@reverse" .= object
+                    [ "http://example/writer" .=
+                        [ object [ "@id" .= ("http://author/manu" :: String) ] ]
+                    ]
+                ]
+        run doc @?= Right expected
+
+    , testCase "@index container map adds @index annotations" $ do
+        let doc = object
+                [ "@context" .= object
+                    [ "items" .= object
+                        [ "@id"        .= ("http://example/items" :: String)
+                        , "@container" .= ("@index" :: String)
+                        ]
+                    ]
+                , "items" .= object
+                    [ "a" .= ("first"  :: String)
+                    , "b" .= ("second" :: String)
+                    ]
+                ]
+            checkIndexed (Object o) = KM.member "@value" o && KM.member "@index" o
+            checkIndexed _          = False
+        case run doc of
+            Right (Array arr)
+                | [Object km] <- V.toList arr
+                , Just (Array vs) <- KM.lookup "http://example/items" km
+                , length vs == 2
+                , all checkIndexed (V.toList vs)
+                    -> pure ()
+            other -> assertFailure $ "unexpected: " <> show other
+
+    , testCase "@index map with @none omits @index" $ do
+        let doc = object
+                [ "@context" .= object
+                    [ "items" .= object
+                        [ "@id"        .= ("http://example/items" :: String)
+                        , "@container" .= ("@index" :: String)
+                        ]
+                    ]
+                , "items" .= object
+                    [ "@none" .= ("plain" :: String) ]
+                ]
+            expected = Array $ V.singleton $ object
+                [ "http://example/items" .=
+                    [ object [ "@value" .= ("plain" :: String) ] ]
+                ]
+        run doc @?= Right expected
+
+    , testCase "@id container map adds @id to each entry" $ do
+        let doc = object
+                [ "@context" .= object
+                    [ "name" .= ("http://example/name" :: String)
+                    , "by"   .= object
+                        [ "@id"        .= ("http://example/by" :: String)
+                        , "@container" .= ("@id" :: String)
+                        ]
+                    ]
+                , "by" .= object
+                    [ "http://example/a" .= object [ "name" .= ("Alice" :: String) ]
+                    , "http://example/b" .= object [ "name" .= ("Bob"   :: String) ]
+                    ]
+                ]
+            hasIdAndName (Object o) =
+                KM.member "@id" o && KM.member "http://example/name" o
+            hasIdAndName _ = False
+        case run doc of
+            Right (Array arr)
+                | [Object km] <- V.toList arr
+                , Just (Array vs) <- KM.lookup "http://example/by" km
+                , length vs == 2
+                , all hasIdAndName (V.toList vs)
+                    -> pure ()
+            other -> assertFailure $ "unexpected: " <> show other
     ]
 
 run :: Value -> Either JsonLdError Value
