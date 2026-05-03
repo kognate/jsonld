@@ -9,6 +9,7 @@ module Test.JsonLd.ExpandSpec
 
 import           Data.Aeson         (Value (..), object, (.=))
 import qualified Data.Aeson         as A
+import qualified Data.Aeson.KeyMap  as KM
 import qualified Data.Vector        as V
 import           Test.Tasty         (TestTree, testGroup)
 import           Test.Tasty.HUnit   (Assertion, assertFailure, testCase, (@?=))
@@ -133,6 +134,126 @@ tests = testGroup "Data.JsonLd.Expand"
             expected = Array $ V.singleton $ object
                 [ "http://example/name" .=
                     [ object ["@value" .= ("kept" :: String)] ]
+                ]
+        run doc @?= Right expected
+
+    , testCase "property-scoped @context applies during recursive expand" $ do
+        -- The "owner" property has its own @context that defines "name".
+        -- The outer context doesn't, so "name" only resolves under owner.
+        let doc = object
+                [ "@context" .= object
+                    [ "owner" .= object
+                        [ "@id"      .= ("http://example/owner" :: String)
+                        , "@context" .= object
+                            [ "name" .= ("http://example/name" :: String) ]
+                        ]
+                    ]
+                , "owner" .= object [ "name" .= ("Manu" :: String) ]
+                ]
+            expected = Array $ V.singleton $ object
+                [ "http://example/owner" .=
+                    [ object
+                        [ "http://example/name" .=
+                            [ object ["@value" .= ("Manu" :: String)] ]
+                        ]
+                    ]
+                ]
+        run doc @?= Right expected
+
+    , testCase "type-scoped @context applies after @type" $ do
+        -- @type Person triggers a Person-scoped context that defines "name".
+        let doc = object
+                [ "@context" .= object
+                    [ "Person" .= object
+                        [ "@id"      .= ("http://example/Person" :: String)
+                        , "@context" .= object
+                            [ "name" .= ("http://example/name" :: String) ]
+                        ]
+                    ]
+                , "@type" .= ("Person" :: String)
+                , "name"  .= ("Manu" :: String)
+                ]
+            expected = Array $ V.singleton $ object
+                [ "@type" .= [ "http://example/Person" :: String ]
+                , "http://example/name" .=
+                    [ object ["@value" .= ("Manu" :: String)] ]
+                ]
+        run doc @?= Right expected
+
+    , testCase "@direction applied via active context" $ do
+        let doc = object
+                [ "@context" .= object
+                    [ "@version"   .= (1.1 :: Double)
+                    , "@language"  .= ("ar"  :: String)
+                    , "@direction" .= ("rtl" :: String)
+                    , "name"       .= ("http://example/name" :: String)
+                    ]
+                , "name" .= ("سلام" :: String)
+                ]
+            expected = Array $ V.singleton $ object
+                [ "http://example/name" .=
+                    [ object
+                        [ "@value"     .= ("سلام" :: String)
+                        , "@language"  .= ("ar"   :: String)
+                        , "@direction" .= ("rtl"  :: String)
+                        ]
+                    ]
+                ]
+        run doc @?= Right expected
+
+    , testCase "@direction term slot overrides active context" $ do
+        let doc = object
+                [ "@context" .= object
+                    [ "@version"   .= (1.1 :: Double)
+                    , "@direction" .= ("rtl" :: String)
+                    , "name" .= object
+                        [ "@id"        .= ("http://example/name" :: String)
+                        , "@direction" .= Null
+                        ]
+                    ]
+                , "name" .= ("hello" :: String)
+                ]
+            expected = Array $ V.singleton $ object
+                [ "http://example/name" .=
+                    [ object [ "@value" .= ("hello" :: String) ] ]
+                ]
+        run doc @?= Right expected
+
+    , testCase "@language container map expands to language-tagged values" $ do
+        let doc = object
+                [ "@context" .= object
+                    [ "label" .= object
+                        [ "@id"        .= ("http://example/label" :: String)
+                        , "@container" .= ("@language" :: String)
+                        ]
+                    ]
+                , "label" .= object
+                    [ "en" .= ("Hello" :: String)
+                    , "fr" .= ("Bonjour" :: String)
+                    ]
+                ]
+        case run doc of
+            Right (Array arr)
+                | [Object km] <- V.toList arr
+                , Just (Array vs) <- KM.lookup "http://example/label" km
+                , length vs == 2
+                    -> pure ()
+            other -> assertFailure $ "unexpected: " <> show other
+
+    , testCase "@language map with @none key omits @language" $ do
+        let doc = object
+                [ "@context" .= object
+                    [ "label" .= object
+                        [ "@id"        .= ("http://example/label" :: String)
+                        , "@container" .= ("@language" :: String)
+                        ]
+                    ]
+                , "label" .= object
+                    [ "@none" .= ("Hello" :: String) ]
+                ]
+            expected = Array $ V.singleton $ object
+                [ "http://example/label" .=
+                    [ object [ "@value" .= ("Hello" :: String) ] ]
                 ]
         run doc @?= Right expected
     ]

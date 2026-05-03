@@ -25,18 +25,21 @@ import           Control.Monad       (foldM)
 import           Data.Aeson          (Value (..), object)
 import qualified Data.Aeson.Key      as Key
 import qualified Data.Aeson.KeyMap   as KM
+import qualified Data.List           as List
 import qualified Data.Map.Strict     as Map
 import           Data.Text           (Text)
 import qualified Data.Text           as T
 import qualified Data.Vector         as V
 
 import           Data.JsonLd.Context (ActiveContext (..), Container (..),
-                                      CtxConfig, TermDefinition (..),
+                                      CtxConfig (..), TermDefinition (..),
+                                      TermSlot (..),
                                       defaultCtxConfig, emptyActiveContext,
                                       expandIriCtx, processContext)
 import           Data.JsonLd.Error
 import           Data.JsonLd.Keyword (isKeyword)
-import           Data.JsonLd.Types   (Document (..), Options (..))
+import           Data.JsonLd.Types   (Direction (..), Document (..),
+                                      Options (..))
 
 ------------------------------------------------------------------------
 -- Top-level §5.1.1
@@ -136,11 +139,15 @@ expandObject
     -> KM.KeyMap Value
     -> Either JsonLdError Value
 expandObject cfg ctx0 mActiveProp km = do
-    -- Step 6: process @context. Type-scoped and property-scoped contexts
-    -- are not yet honoured — see Phase 2 part 3 / Phase 3 follow-up.
-    ctx <- case KM.lookup "@context" km of
+    -- Step 6: process local @context.
+    ctx1 <- case KM.lookup "@context" km of
         Just c  -> processContext cfg ctx0 c
         Nothing -> Right ctx0
+
+    -- Step 8: type-scoped contexts. For each value of any @type-aliased
+    -- entry (in alphabetical order) whose term def has a scoped
+    -- @context, layer that context on top with propagate=False.
+    ctx2 <- applyTypeScopedContexts cfg ctx1 km
 
     -- Step 9: iterate the remaining entries.
     let entries =
@@ -148,9 +155,49 @@ expandObject cfg ctx0 mActiveProp km = do
             | (k, v) <- KM.toList km
             , Key.toText k /= "@context"
             ]
-    result <- foldM (foldEntry cfg ctx mActiveProp) KM.empty entries
+    result <- foldM (foldEntry cfg ctx2 mActiveProp) KM.empty entries
 
     Right (finaliseObject mActiveProp result)
+
+-- | §5.1.2 step 8: apply each type's scoped @context (if any) on top of
+-- the current active context with propagation disabled.
+applyTypeScopedContexts
+    :: CtxConfig
+    -> ActiveContext
+    -> KM.KeyMap Value
+    -> Either JsonLdError ActiveContext
+applyTypeScopedContexts cfg ctx km = do
+    typeNames <- collectTypeValues ctx km
+    foldM applyOne ctx (List.sort typeNames)
+  where
+    applyOne acc t = case Map.lookup t (acTerms acc) >>= tdContext of
+        Just c -> processContext
+            (cfg { ccPropagate = False, ccOverrideProtected = True })
+            acc c
+        Nothing -> Right acc
+
+-- | Collect every value of any entry whose key (after IRI expansion)
+-- equals @\@type@. Each value must be a string or array of strings.
+collectTypeValues
+    :: ActiveContext
+    -> KM.KeyMap Value
+    -> Either JsonLdError [Text]
+collectTypeValues ctx km =
+    fmap concat (traverse extract (KM.toList km))
+  where
+    extract (k, v) = do
+        expanded <- expandIriCtx ctx True False (Key.toText k)
+        if expanded == "@type"
+            then case v of
+                String s -> Right [s]
+                Array xs -> traverse asString (V.toList xs)
+                _ -> Left $ JsonLdError InvalidTypeValue
+                    "@type must be a string or array of strings"
+            else Right []
+
+    asString (String s) = Right s
+    asString _ = Left $ JsonLdError InvalidTypeValue
+        "@type array elements must be strings"
 
 -- | Process one (key, value) pair from a context-update-applied object.
 foldEntry
@@ -170,8 +217,10 @@ foldEntry cfg ctx mActiveProp acc (key, value) = do
                 then handleProperty cfg ctx acc expandedKey key value
                 else Right acc      -- unmapped term: drop
 
--- | Property entry: expand the value with this property as active, wrap
--- in an array, and merge into the accumulator.
+-- | Property entry. Applies any property-scoped @\@context@ on the
+-- term, then dispatches to a container-aware expansion (currently
+-- only @\@language@-map handling is done specially) or the normal
+-- recursive expansion.
 handleProperty
     :: CtxConfig
     -> ActiveContext
@@ -181,12 +230,54 @@ handleProperty
     -> Value
     -> Either JsonLdError (KM.KeyMap Value)
 handleProperty cfg ctx acc expandedKey origKey value = do
-    expanded <- expandElement cfg ctx (Just origKey) value
-    let arr = case expanded of
-            Null     -> Array V.empty
-            Array xs -> Array xs
-            v        -> Array (V.singleton v)
+    let mTd        = Map.lookup origKey (acTerms ctx)
+        containers = maybe [] tdContainers mTd
+
+    -- §5.1.2 step 13.5: property-scoped @context.
+    ctx' <- case mTd >>= tdContext of
+        Just c -> processContext (cfg { ccOverrideProtected = True }) ctx c
+        Nothing -> Right ctx
+
+    case (containers, value) of
+        (cs, Object km) | CLanguage `elem` cs ->
+            expandLanguageMap acc expandedKey km
+        _ -> do
+            expanded <- expandElement cfg ctx' (Just origKey) value
+            let arr = case expanded of
+                    Null     -> Array V.empty
+                    Array xs -> Array xs
+                    v        -> Array (V.singleton v)
+            Right (KM.insertWith mergeArrays (Key.fromText expandedKey) arr acc)
+
+-- | Expand a value used with @\@container: @\@language@ — a map keyed
+-- by language tag whose values are strings (or arrays of strings).
+-- The special key @\@none@ produces a value object with no language.
+expandLanguageMap
+    :: KM.KeyMap Value
+    -> Text
+    -> KM.KeyMap Value
+    -> Either JsonLdError (KM.KeyMap Value)
+expandLanguageMap acc expandedKey langMap = do
+    pairs <- concat <$> traverse expandPair (KM.toList langMap)
+    let arr = Array (V.fromList pairs)
     Right (KM.insertWith mergeArrays (Key.fromText expandedKey) arr acc)
+  where
+    expandPair (langKey, val) = do
+        let langText = Key.toText langKey
+            mLang | langText == "@none" = Nothing
+                  | otherwise           = Just (T.toLower langText)
+        case val of
+            String s -> Right [valueObj s mLang]
+            Array xs -> traverse (asString mLang) (V.toList xs)
+            _ -> Left $ JsonLdError InvalidLanguageMapValue
+                "@language map value must be a string or array of strings"
+
+    asString mLang (String s) = Right (valueObj s mLang)
+    asString _     _          = Left $ JsonLdError InvalidLanguageMapValue
+        "@language map array elements must be strings"
+
+    valueObj s (Just l) = object [("@value", String s), ("@language", String l)]
+    valueObj s Nothing  = object [("@value", String s)]
 
 -- | Keyword entry: each keyword has a specific handling rule.
 handleKeyword
@@ -294,10 +385,11 @@ finaliseObject mActiveProp result
 ------------------------------------------------------------------------
 -- §5.3.1 Value Expansion
 
--- | Wrap a scalar value into a value- or node-object form, applying
--- the term's type coercion and falling back to the default language
--- when applicable. Direction handling and the full @\@language@-map
--- container case are deferred.
+-- | Wrap a scalar value into a value- or node-object form. Applies
+-- term-level type coercion (@\@id@, @\@vocab@, @\@json@, or an IRI),
+-- and otherwise emits a value object whose @\@language@ and
+-- @\@direction@ are sourced from the term's slots (or, if the term
+-- doesn't override, the active context's defaults).
 expandValue
     :: CtxConfig
     -> ActiveContext
@@ -305,8 +397,8 @@ expandValue
     -> Value
     -> Either JsonLdError Value
 expandValue _cfg ctx prop value =
-    let mTd        = Map.lookup prop (acTerms ctx)
-        typeMap    = mTd >>= tdType
+    let mTd     = Map.lookup prop (acTerms ctx)
+        typeMap = mTd >>= tdType
     in case typeMap of
         Just "@id"
             | String s <- value -> do
@@ -322,8 +414,26 @@ expandValue _cfg ctx prop value =
             Right (object [("@value", value), ("@type", String typeIri)])
         Nothing -> case value of
             String _ ->
-                let withLang = case acLanguage ctx of
-                        Just l  -> object [("@value", value), ("@language", String l)]
-                        Nothing -> object [("@value", value)]
-                in Right withLang
+                let lang = resolveSlot (maybe SlotUnset tdLanguage mTd)
+                                       (acLanguage ctx)
+                    dir  = resolveSlot (maybe SlotUnset tdDirection mTd)
+                                       (directionText <$> acDirection ctx)
+                    base = KM.fromList [("@value", value)]
+                    withLang = maybe base
+                        (\l -> KM.insert "@language" (String l) base) lang
+                    withDir  = maybe withLang
+                        (\d -> KM.insert "@direction" (String d) withLang) dir
+                in Right (Object withDir)
             _ -> Right (object [("@value", value)])
+
+-- | Resolve a 'TermSlot' against a default. The semantics are: an
+-- explicit @null@ slot ('SlotNull') overrides the default to nothing,
+-- a value slot wins, and an unset slot falls through.
+resolveSlot :: TermSlot -> Maybe Text -> Maybe Text
+resolveSlot SlotUnset      def = def
+resolveSlot SlotNull       _   = Nothing
+resolveSlot (SlotValue v) _    = Just v
+
+directionText :: Direction -> Text
+directionText DirLtr = "ltr"
+directionText DirRtl = "rtl"
